@@ -1,0 +1,10 @@
+# 忽略编译产物
+*.exe
+*.o
+*.res
+*.rc
+icon.ico
+
+# IDE 配置
+.vscode/
+.idea/
