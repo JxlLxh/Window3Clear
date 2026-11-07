@@ -53,4 +53,4 @@ Linux、MacOS 暂不支持，对此我们深感歉意。
 
 ## 📄 开源协议
 
-本项目基于 MIT License 开源。版本 V18 Pro，保留所有权利。
+本项目基于 MIT License 开源。版本 v18.0-pro，保留所有权利。
