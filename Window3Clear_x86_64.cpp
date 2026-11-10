@@ -1,6 +1,10 @@
 #define _WIN32_WINNT 0x0600
+#ifndef UNICODE
 #define UNICODE
+#endif
+#ifndef _UNICODE
 #define _UNICODE
+#endif
 #define _CRT_SECURE_NO_WARNINGS
 
 #include <windows.h>
@@ -22,7 +26,7 @@
 #endif
 
 #define APP_NAME     L"Window3Clear"
-#define APP_VERSION  L"v19.0-beta"
+#define APP_VERSION  L"v19.1-beta"
 #define APP_TAGLINE  L"轻量级 Windows 窗口透明度管理"
 
 // ================= 亚克力 API =================
@@ -33,6 +37,16 @@ typedef BOOL (WINAPI *PFN_SetWindowCompositionAttribute)(HWND, WINDOWCOMPOSITION
 #define WCA_ACCENT_POLICY 19
 
 void EnableAcrylic(HWND hwnd, DWORD color, bool enable = true) {
+    // 补丁：Win10 1809 以下系统直接禁用亚克力，防止崩溃
+    typedef LONG (WINAPI *PFN_RtlGetVersion)(PRTL_OSVERSIONINFOW);
+    PFN_RtlGetVersion rtlGetVersion = (PFN_RtlGetVersion)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    if (rtlGetVersion) {
+        RTL_OSVERSIONINFOW vi = { sizeof(vi) };
+        rtlGetVersion(&vi);
+        if (vi.dwMajorVersion == 10 && vi.dwBuildNumber < 17763) return;
+        if (vi.dwMajorVersion < 10) return;
+    }
+
     HMODULE user32 = GetModuleHandleW(L"user32.dll");
     if (!user32) return;
     PFN_SetWindowCompositionAttribute SetWindowCompositionAttribute = (PFN_SetWindowCompositionAttribute)GetProcAddress(user32, "SetWindowCompositionAttribute");
@@ -64,6 +78,7 @@ void EnableAcrylic(HWND hwnd, DWORD color, bool enable = true) {
 #define HK_BOSS 10
 #define HK_MOYU 11
 #define HK_MASK 15
+#define HK_EMERGENCY 16
 
 #define WIN_W 800
 #define WIN_H 520
@@ -93,6 +108,12 @@ struct AppConfig {
     std::wstring maskKey = L"";
     int  maskAlpha     = 128;
     bool maskEnabled   = false;
+    bool maskOnAdjust  = true;   // 是否在调节时强制面具
+    bool isLightTheme  = false;  // 浅色主题
+    int  hk_pick = 'P';
+    int  hk_boss = 'H';
+    int  hk_moyu = 'M';
+    int  hk_mask = 'B';
 };
 AppConfig g_cfg;
 
@@ -153,6 +174,12 @@ void LoadConfig() {
             else if (k == "RestoreOnExit") g_cfg.restoreOnExit = atoi(v.c_str()) != 0;
             else if (k == "MaskAlpha")     g_cfg.maskAlpha = atoi(v.c_str());
             else if (k == "MaskEnabled")   g_cfg.maskEnabled = atoi(v.c_str()) != 0;
+            else if (k == "MaskOnAdjust")  g_cfg.maskOnAdjust = atoi(v.c_str()) != 0;
+            else if (k == "LightTheme")    g_cfg.isLightTheme = atoi(v.c_str()) != 0;
+            else if (k == "HkPick")        g_cfg.hk_pick = atoi(v.c_str());
+            else if (k == "HkBoss")        g_cfg.hk_boss = atoi(v.c_str());
+            else if (k == "HkMoyu")        g_cfg.hk_moyu = atoi(v.c_str());
+            else if (k == "HkMask")        g_cfg.hk_mask = atoi(v.c_str());
             else if (k == "MaskKey")       g_cfg.maskKey = Utf8ToWide(v);
         } else if (section == "Profiles") {
             std::wstring wk = Utf8ToWide(k);
@@ -180,6 +207,12 @@ void SaveConfig() {
         sprintf(b, "RestoreOnExit=%d\n", g_cfg.restoreOnExit ? 1 : 0);  content += b;
         sprintf(b, "MaskAlpha=%d\n", g_cfg.maskAlpha);                  content += b;
         sprintf(b, "MaskEnabled=%d\n", g_cfg.maskEnabled ? 1 : 0);      content += b;
+        sprintf(b, "MaskOnAdjust=%d\n", g_cfg.maskOnAdjust ? 1 : 0);    content += b;
+        sprintf(b, "LightTheme=%d\n", g_cfg.isLightTheme ? 1 : 0);      content += b;
+        sprintf(b, "HkPick=%d\n", g_cfg.hk_pick);                       content += b;
+        sprintf(b, "HkBoss=%d\n", g_cfg.hk_boss);                       content += b;
+        sprintf(b, "HkMoyu=%d\n", g_cfg.hk_moyu);                       content += b;
+        sprintf(b, "HkMask=%d\n", g_cfg.hk_mask);                       content += b;
         content += "MaskKey=" + WideToUtf8(g_cfg.maskKey) + "\n";
     }
     content += "\n[Profiles]\n";
@@ -228,6 +261,7 @@ void SetAutoStart(bool enable) {
 
 // ================= 全局状态 =================
 HWND g_hwnd = NULL, g_hSearchEdit = NULL;
+HWND g_hEmergencyMask = NULL;
 HWND g_hOverlay = NULL;
 HWND g_bossHide = NULL;
 
@@ -293,6 +327,7 @@ HWND    g_hSettingsDlg  = NULL;
 int     g_settingsHover = -1;
 bool    g_settingsAutoStartTmp = false;
 bool    g_settingsRestoreTmp   = true;
+int     g_waitingHotkey = 0; // 1=拾取, 2=老板键, 3=摸鱼, 4=面具
 
 // 面具设置对话框
 HWND    g_hMaskDlg      = NULL;
@@ -308,6 +343,29 @@ void*   g_overlayBits = NULL;
 HWND    g_pickerHover = NULL;
 
 void RestoreApp(HWND hwnd);
+
+// ================= 热键注册 =================
+void RegisterAllHotkeys(HWND hwnd) {
+    UnregisterHotKey(hwnd, HK_DOWN);
+    UnregisterHotKey(hwnd, HK_UP);
+    UnregisterHotKey(hwnd, HK_RESET);
+    UnregisterHotKey(hwnd, HK_P1); UnregisterHotKey(hwnd, HK_P2); UnregisterHotKey(hwnd, HK_P3); UnregisterHotKey(hwnd, HK_P4);
+    UnregisterHotKey(hwnd, HK_PICK); UnregisterHotKey(hwnd, HK_BOSS); UnregisterHotKey(hwnd, HK_MOYU); UnregisterHotKey(hwnd, HK_MASK);
+
+    RegisterHotKey(hwnd, HK_DOWN, MOD_CONTROL|MOD_ALT, VK_LEFT);
+    RegisterHotKey(hwnd, HK_UP,   MOD_CONTROL|MOD_ALT, VK_RIGHT);
+    RegisterHotKey(hwnd, HK_RESET, MOD_CONTROL|MOD_ALT, '0');
+    RegisterHotKey(hwnd, HK_P1, MOD_CONTROL|MOD_SHIFT, '1');
+    RegisterHotKey(hwnd, HK_P2, MOD_CONTROL|MOD_SHIFT, '2');
+    RegisterHotKey(hwnd, HK_P3, MOD_CONTROL|MOD_SHIFT, '3');
+    RegisterHotKey(hwnd, HK_P4, MOD_CONTROL|MOD_SHIFT, '4');
+    
+    RegisterHotKey(hwnd, HK_PICK, MOD_CONTROL|MOD_ALT, g_cfg.hk_pick);
+    RegisterHotKey(hwnd, HK_BOSS, MOD_CONTROL|MOD_ALT, g_cfg.hk_boss);
+    RegisterHotKey(hwnd, HK_MOYU, MOD_CONTROL|MOD_ALT, g_cfg.hk_moyu);
+    RegisterHotKey(hwnd, HK_MASK, MOD_CONTROL|MOD_ALT, g_cfg.hk_mask);
+    RegisterHotKey(hwnd, HK_EMERGENCY, MOD_CONTROL|MOD_ALT, 'S');
+}
 
 // ================= 核心逻辑 =================
 typedef BOOL (WINAPI *PFN_QueryFullProcessImageNameW)(HANDLE, DWORD, LPWSTR, PDWORD);
@@ -389,13 +447,16 @@ void LockTarget(HWND h, const std::wstring& t) {
         g_locked_key = GetKey(h);
         if (g_profiles.count(g_locked_key)) g_target_alpha = g_profiles[g_locked_key].alpha;
         else g_target_alpha = 255;
-        g_render_alpha = g_target_alpha;
+        g_render_alpha = g_target_alpha; // 强制切断上一个窗口的渲染残留
     } else {
         g_locked_key.clear();
         g_target_alpha = 255;
         g_render_alpha = 255;
     }
+    g_fadeActive = false;
+    g_breathActive = false;
     LeaveCriticalSection(&g_cs);
+    InvalidateRect(g_hwnd, NULL, FALSE); // 强制刷新界面
 }
 
 bool HasTarget() {
@@ -429,8 +490,8 @@ void ExecuteWithMask(HWND target, int targetAlpha, bool instant = true) {
     if (targetAlpha > MAX_ALPHA) targetAlpha = MAX_ALPHA;
     if (targetAlpha < MIN_ALPHA) targetAlpha = MIN_ALPHA;
 
-    // 如果面具未开启，直接应用并同步界面
-    if (!g_cfg.maskEnabled) {
+    // 如果面具未开启，或者没有勾选“调节时遮挡”，直接应用并同步界面
+    if (!g_cfg.maskEnabled || !g_cfg.maskOnAdjust) {
         if (IsWindow(target)) ApplyAlpha(target, targetAlpha, true);
         EnterCriticalSection(&g_cs);
         g_render_alpha = targetAlpha;
@@ -489,7 +550,7 @@ void ApplyAlphaSafe(HWND target, int alpha, bool save = true) {
     if (alpha > MAX_ALPHA) alpha = MAX_ALPHA;
     if (alpha < MIN_ALPHA) alpha = MIN_ALPHA;
     
-    if (g_cfg.maskEnabled && IsWindow(target)) {
+    if (g_cfg.maskEnabled && g_cfg.maskOnAdjust && IsWindow(target)) {
         ExecuteWithMask(target, alpha, true);
     } else {
         ApplyAlpha(target, alpha, save);
@@ -512,8 +573,7 @@ void StartCustomFade(int seconds, int percent) {
     g_cfg.lastFadePct = percent;
     int targetAlpha = (percent * 255 + 50) / 100;
 
-    if (g_cfg.maskEnabled && GetMaskWindow()) {
-        // 面具模式下，渐隐直接变成瞬间更改（并带面具动画）
+    if (g_cfg.maskEnabled && g_cfg.maskOnAdjust && GetMaskWindow()) {
         ExecuteWithMask(GetRealTarget(), targetAlpha, true);
     } else {
         EnterCriticalSection(&g_cs);
@@ -530,8 +590,8 @@ void StartCustomFade(int seconds, int percent) {
 }
 
 void ToggleBreath() {
-    if (g_cfg.maskEnabled && GetMaskWindow()) {
-        MessageBoxW(g_hwnd, L"开启面具时无法使用呼吸灯特效，请先关闭面具。", L"提示", MB_OK | MB_ICONINFORMATION);
+    if (g_cfg.maskEnabled && g_cfg.maskOnAdjust && GetMaskWindow()) {
+        MessageBoxW(g_hwnd, L"开启面具时无法使用呼吸灯特效，请先关闭面具或取消强制遮挡。", L"提示", MB_OK | MB_ICONINFORMATION);
         return;
     }
 
@@ -562,6 +622,42 @@ void ResetAllWindows() {
     
     for (auto w : wins) if (IsWindow(w)) ApplyAlpha(w, 255, false);
     if (g_hwnd) InvalidateRect(g_hwnd, NULL, FALSE);
+}
+
+// ================= 紧急遮罩 =================
+LRESULT CALLBACK EmergencyMaskProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc; GetClientRect(hwnd, &rc);
+        HBRUSH b = CreateSolidBrush(RGB(0, 0, 0)); // 纯黑遮罩
+        FillRect(hdc, &rc, b); DeleteObject(b);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_KEYDOWN:
+        if (wParam == VK_ESCAPE) { DestroyWindow(hwnd); g_hEmergencyMask = NULL; }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void ToggleEmergencyMask() {
+    if (g_hEmergencyMask && IsWindow(g_hEmergencyMask)) {
+        DestroyWindow(g_hEmergencyMask);
+        g_hEmergencyMask = NULL;
+        return;
+    }
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSEXW wc = {sizeof(wc)}; wc.lpfnWndProc = EmergencyMaskProc; wc.hInstance = GetModuleHandleW(NULL);
+        wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH); wc.lpszClassName = L"Win3CEmergency";
+        RegisterClassExW(&wc); reg = true;
+    }
+    int w = GetSystemMetrics(SM_CXSCREEN), h = GetSystemMetrics(SM_CYSCREEN);
+    g_hEmergencyMask = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, L"Win3CEmergency", L"", WS_POPUP | WS_VISIBLE, 0, 0, w, h, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    SetForegroundWindow(g_hEmergencyMask);
+    SetFocus(g_hEmergencyMask);
 }
 
 // ================= 后台动画线程 =================
@@ -596,8 +692,8 @@ DWORD WINAPI AnimThreadProc(LPVOID lpParam) {
         }
         else {
             int r = g_render_alpha, t = g_target_alpha;
-            // ★ 修复：面具开启时，禁止后台线程自作主张平滑过渡
-            if (r != t && !g_cfg.maskEnabled) {
+            // 面具开启时，禁止后台线程自作主张平滑过渡
+            if (r != t && !(g_cfg.maskEnabled && g_cfg.maskOnAdjust)) {
                 int diff = t - r;
                 if (diff > 0) r += (diff * 0.25 > 1 ? (int)(diff * 0.25) : 1);
                 else r -= (-diff * 0.25 > 1 ? (int)(-diff * 0.25) : 1);
@@ -606,10 +702,19 @@ DWORD WINAPI AnimThreadProc(LPVOID lpParam) {
             }
         }
         LeaveCriticalSection(&g_cs);
-        if (doApply && IsWindow(target) && !g_cfg.maskEnabled) ApplyAlpha(target, aToApply, false);
+        if (doApply && IsWindow(target) && !(g_cfg.maskEnabled && g_cfg.maskOnAdjust)) ApplyAlpha(target, aToApply, false);
         if (needPost) PostMessageW(g_hwnd, WM_UI_REFRESH, 0, 0);
     }
     return 0;
+}
+
+// ================= 主题更新 =================
+void UpdateTheme() {
+    if (g_cfg.isLightTheme) {
+        g_theme = { RGB(10, 132, 255), RGB(30, 30, 30), RGB(100, 100, 110), RGB(240, 240, 245), RGB(220, 220, 230) };
+    } else {
+        g_theme = { RGB(10, 132, 255), RGB(255, 255, 255), RGB(150, 150, 160), RGB(40, 40, 45), RGB(60, 60, 70) };
+    }
 }
 
 // ================= GDI 工具 =================
@@ -641,14 +746,14 @@ void DrawCrosshair(HDC hdc, int cx, int cy, COLORREF color) {
     FillCircle(hdc, cx, cy, 2, color); DeleteObject(pen);
 }
 void DrawCheckbox(HDC hdc, RECT r, bool checked, bool hover) {
-    int size = r.bottom - r.top;
+    int size = S(18);
     RECT box = {r.left, r.top + (r.bottom - r.top - size) / 2, r.left + size, r.top + (r.bottom - r.top + size) / 2};
-    FillRound(hdc, box, S(4), checked ? g_theme.accent : (hover ? RGB(60,60,70) : RGB(50,50,55)));
-    StrokeRound(hdc, box, S(4), checked ? g_theme.accent : RGB(80,80,90), 1);
+    FillRound(hdc, box, S(4), checked ? g_theme.accent : (hover ? g_theme.hover : g_theme.cardBg));
+    StrokeRound(hdc, box, S(4), checked ? g_theme.accent : g_theme.textDim, 1);
     if (checked) {
         HPEN pen = CreatePen(PS_SOLID, S(2), RGB(255,255,255)); SelectObject(hdc, pen);
         int cx = (box.left + box.right) / 2, cy = (box.top + box.bottom) / 2;
-        MoveToEx(hdc, cx - S(5), cy, NULL); LineTo(hdc, cx - S(1), cy + S(4)); LineTo(hdc, cx + S(6), cy - S(4));
+        MoveToEx(hdc, cx - S(4), cy, NULL); LineTo(hdc, cx - S(1), cy + S(3)); LineTo(hdc, cx + S(5), cy - S(4));
         DeleteObject(pen);
     }
 }
@@ -787,12 +892,13 @@ void PaintMenu(HWND hwnd) {
     PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
     RECT rc; GetClientRect(hwnd, &rc);
     HDC mem = CreateCompatibleDC(hdc); HBITMAP bmp = CreateCompatibleBitmap(hdc, rc.right, rc.bottom); SelectObject(mem, bmp);
-    FillRound(mem, rc, S(8), RGB(30, 30, 35)); StrokeRound(mem, rc, S(8), RGB(60, 60, 65), 1);
+    FillRound(mem, rc, S(8), g_cfg.isLightTheme ? RGB(250, 250, 255) : RGB(30, 30, 35));
+    StrokeRound(mem, rc, S(8), g_theme.textDim, 1);
     int y = S(8);
     for (size_t i = 0; i < g_menuItems.size(); i++) {
         auto& item = g_menuItems[i]; int ih = item.isSep ? S(9) : S(36);
         if (item.isSep) {
-            RECT line = {S(10), y + ih/2, rc.right - S(10), y + ih/2 + 1}; HBRUSH b = CreateSolidBrush(RGB(60, 60, 65));
+            RECT line = {S(10), y + ih/2, rc.right - S(10), y + ih/2 + 1}; HBRUSH b = CreateSolidBrush(g_theme.textDim);
             FillRect(mem, &line, b); DeleteObject(b);
         } else {
             RECT ir = {S(4), y, rc.right - S(4), y + ih};
@@ -860,8 +966,9 @@ LRESULT CALLBACK HelpProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         HDC mem = CreateCompatibleDC(hdc); HBITMAP bmp = CreateCompatibleBitmap(hdc, S(520), S(420)); SelectObject(mem, bmp);
         RECT rc = {0, 0, S(520), S(420)};
-        FillRound(mem, rc, S(12), RGB(35, 35, 40)); StrokeRound(mem, rc, S(12), RGB(60, 60, 65), 1);
-        RECT title = {0, 0, S(520), S(48)}; HBRUSH tb = CreateSolidBrush(RGB(28, 28, 32)); FillRect(mem, &title, tb); DeleteObject(tb);
+        FillRound(mem, rc, S(12), g_cfg.isLightTheme ? RGB(250, 250, 255) : RGB(35, 35, 40));
+        StrokeRound(mem, rc, S(12), g_theme.textDim, 1);
+        RECT title = {0, 0, S(520), S(48)}; HBRUSH tb = CreateSolidBrush(g_theme.cardBg); FillRect(mem, &title, tb); DeleteObject(tb);
         RECT btnClose = {S(520) - S(46), 0, S(520), S(48)};
         if (g_helpHoverClose) { HBRUSH cb = CreateSolidBrush(RGB(232, 17, 35)); FillRect(mem, &btnClose, cb); DeleteObject(cb); }
         HPEN penC = CreatePen(PS_SOLID, 1, g_helpHoverClose ? RGB(255,255,255) : g_theme.textDim); SelectObject(mem, penC);
@@ -872,20 +979,19 @@ LRESULT CALLBACK HelpProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         DrawTextC(mem, L"【面具防窥功能】", {S(30), S(60), S(490), S(80)}, g_fTitle, g_theme.accent, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawTextC(mem, L"点击主界面“面具”按钮，选择一个伪装窗口并设置透明度。\n"
                        L"开启后，以后你通过快捷键或滑块调节当前锁定窗口的透明度时，\n"
-                       L"系统会先用伪装窗口全屏挡住 2 秒，在底层偷偷修改，然后再悄悄撤走，老师绝对看不到。",
+                       L"系统会先用伪装窗口全屏挡住 2 秒，在底层偷偷修改，然后再悄悄撤走。\n"
+                       L"若不想每次调透明度都被挡，可在设置中关闭“强制遮挡”。",
                   {S(30), S(90), S(490), S(160)}, g_fNormal, g_theme.text, DT_LEFT|DT_TOP|DT_WORDBREAK);
 
         DrawTextC(mem, L"【全局快捷键】", {S(30), S(180), S(490), S(200)}, g_fTitle, g_theme.accent, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawTextC(mem, L"Ctrl + Alt + P      ：鼠标拾取目标窗口（带高亮框）\n"
-                       L"Ctrl + Alt + B      ：极速触发一次面具伪装\n"
-                       L"Ctrl + Alt + H      ：老板键（隐藏/恢复目标）\n"
-                       L"Ctrl + Alt + M      ：摸鱼模式（全局变透明）\n"
-                       L"Ctrl + Alt + 0      ：一键恢复全部窗口透明度",
-                  {S(30), S(210), S(490), S(320)}, g_fNormal, g_theme.text, DT_LEFT|DT_TOP|DT_WORDBREAK);
+        DrawTextC(mem, L"Ctrl + Alt + 方向键 ：调节前台窗口透明度\n"
+                       L"Ctrl + Alt + 0      ：一键恢复全部窗口透明度\n"
+                       L"（更多热键可在“设置”中自行修改）",
+                  {S(30), S(210), S(490), S(270)}, g_fNormal, g_theme.text, DT_LEFT|DT_TOP|DT_WORDBREAK);
                   
-        DrawTextC(mem, L"【功能说明】", {S(30), S(330), S(490), S(350)}, g_fTitle, g_theme.accent, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawTextC(mem, L"【功能说明】", {S(30), S(290), S(490), S(310)}, g_fTitle, g_theme.accent, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawTextC(mem, L"所有窗口的透明度配置会自动保存，重启后还原。",
-                  {S(30), S(360), S(490), S(400)}, g_fNormal, g_theme.text, DT_LEFT|DT_TOP|DT_WORDBREAK);
+                  {S(30), S(320), S(490), S(400)}, g_fNormal, g_theme.text, DT_LEFT|DT_TOP|DT_WORDBREAK);
                   
         BitBlt(hdc, 0, 0, S(520), S(420), mem, 0, 0, SRCCOPY); DeleteObject(bmp); DeleteDC(mem); EndPaint(hwnd, &ps);
         return 0;
@@ -962,15 +1068,16 @@ LRESULT CALLBACK FadeDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
     case WM_CTLCOLOREDIT: {
-        HDC hdc = (HDC)wParam; SetTextColor(hdc, g_theme.text); SetBkColor(hdc, RGB(45, 45, 50));
-        static HBRUSH b = NULL; if (!b) b = CreateSolidBrush(RGB(45, 45, 50)); return (LRESULT)b;
+        HDC hdc = (HDC)wParam; SetTextColor(hdc, g_theme.text); SetBkColor(hdc, g_theme.cardBg);
+        static HBRUSH b = NULL; if (!b) b = CreateSolidBrush(g_theme.cardBg); return (LRESULT)b;
     }
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         HDC mem = CreateCompatibleDC(hdc); HBITMAP bmp = CreateCompatibleBitmap(hdc, S(W), S(H)); SelectObject(mem, bmp);
         RECT rc = {0, 0, S(W), S(H)};
-        FillRound(mem, rc, S(12), RGB(35, 35, 40)); StrokeRound(mem, rc, S(12), RGB(60, 60, 65), 1);
-        RECT title = {0, 0, S(W), S(48)}; HBRUSH tb = CreateSolidBrush(RGB(28, 28, 32)); FillRect(mem, &title, tb); DeleteObject(tb);
+        FillRound(mem, rc, S(12), g_cfg.isLightTheme ? RGB(250, 250, 255) : RGB(35, 35, 40));
+        StrokeRound(mem, rc, S(12), g_theme.textDim, 1);
+        RECT title = {0, 0, S(W), S(48)}; HBRUSH tb = CreateSolidBrush(g_theme.cardBg); FillRect(mem, &title, tb); DeleteObject(tb);
         RECT btnClose = {S(W) - S(46), 0, S(W), S(48)};
         if (g_fadeDlgHover == 2) { HBRUSH cb = CreateSolidBrush(RGB(232, 17, 35)); FillRect(mem, &btnClose, cb); DeleteObject(cb); }
         HPEN penC = CreatePen(PS_SOLID, 1, g_fadeDlgHover == 2 ? RGB(255,255,255) : g_theme.textDim); SelectObject(mem, penC);
@@ -979,16 +1086,16 @@ LRESULT CALLBACK FadeDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         DrawTextC(mem, L"渐隐设置", {S(20), 0, S(200), S(48)}, g_fTitle, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawTextC(mem, L"渐隐时长：", {S(28), S(66), S(120), S(98)}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawTextC(mem, L"目标透明度：", {S(28), S(116), S(120), S(148)}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        RECT secFrame = {S(120), S(66), S(250), S(98)}; FillRound(mem, secFrame, S(6), RGB(45, 45, 50)); StrokeRound(mem, secFrame, S(6), RGB(70, 70, 75), 1);
-        RECT pctFrame = {S(120), S(116), S(250), S(148)}; FillRound(mem, pctFrame, S(6), RGB(45, 45, 50)); StrokeRound(mem, pctFrame, S(6), RGB(70, 70, 75), 1);
+        RECT secFrame = {S(120), S(66), S(250), S(98)}; FillRound(mem, secFrame, S(6), g_theme.cardBg); StrokeRound(mem, secFrame, S(6), g_theme.textDim, 1);
+        RECT pctFrame = {S(120), S(116), S(250), S(148)}; FillRound(mem, pctFrame, S(6), g_theme.cardBg); StrokeRound(mem, pctFrame, S(6), g_theme.textDim, 1);
         DrawTextC(mem, L"秒", {S(258), S(66), S(300), S(98)}, g_fNormal, g_theme.textDim, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawTextC(mem, L"%",  {S(258), S(116), S(300), S(148)}, g_fNormal, g_theme.textDim, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         DrawTextC(mem, L"时长 1~120 秒，目标透明度 1~100%", {S(28), S(156), S(W)-S(28), S(178)}, g_fSmall, g_theme.textDim, DT_LEFT|DT_SINGLELINE);
         int by = S(190), bw2 = S(80), bh = S(34);
         RECT cancelRc = {S(W) - S(30) - bw2*2 - S(10), by, S(W) - S(30) - bw2 - S(10), by+bh};
         RECT okRc     = {S(W) - S(30) - bw2,            by, S(W) - S(30),                by+bh};
-        FillRound(mem, cancelRc, S(8), (g_fadeDlgHover==0) ? g_theme.hover : RGB(50, 50, 55));
-        StrokeRound(mem, cancelRc, S(8), RGB(70, 70, 75), 1);
+        FillRound(mem, cancelRc, S(8), (g_fadeDlgHover==0) ? g_theme.hover : g_theme.cardBg);
+        StrokeRound(mem, cancelRc, S(8), g_theme.textDim, 1);
         DrawTextC(mem, L"取消", cancelRc, g_fNormal, (g_fadeDlgHover==0) ? g_theme.accent : g_theme.text, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         FillRound(mem, okRc, S(8), (g_fadeDlgHover==1) ? RGB(30, 150, 255) : g_theme.accent);
         DrawTextC(mem, L"确定", okRc, g_fNormal, RGB(255, 255, 255), DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -1077,15 +1184,16 @@ LRESULT CALLBACK MaskDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         return 0;
     }
     case WM_CTLCOLOREDIT: {
-        HDC hdc = (HDC)wParam; SetTextColor(hdc, g_theme.text); SetBkColor(hdc, RGB(45, 45, 50));
-        static HBRUSH b = NULL; if (!b) b = CreateSolidBrush(RGB(45, 45, 50)); return (LRESULT)b;
+        HDC hdc = (HDC)wParam; SetTextColor(hdc, g_theme.text); SetBkColor(hdc, g_theme.cardBg);
+        static HBRUSH b = NULL; if (!b) b = CreateSolidBrush(g_theme.cardBg); return (LRESULT)b;
     }
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         HDC mem = CreateCompatibleDC(hdc); HBITMAP bmp = CreateCompatibleBitmap(hdc, S(W), S(H)); SelectObject(mem, bmp);
         RECT rc = {0, 0, S(W), S(H)};
-        FillRound(mem, rc, S(12), RGB(35, 35, 40)); StrokeRound(mem, rc, S(12), RGB(60, 60, 65), 1);
-        RECT title = {0, 0, S(W), S(48)}; HBRUSH tb = CreateSolidBrush(RGB(28, 28, 32)); FillRect(mem, &title, tb); DeleteObject(tb);
+        FillRound(mem, rc, S(12), g_cfg.isLightTheme ? RGB(250, 250, 255) : RGB(35, 35, 40));
+        StrokeRound(mem, rc, S(12), g_theme.textDim, 1);
+        RECT title = {0, 0, S(W), S(48)}; HBRUSH tb = CreateSolidBrush(g_theme.cardBg); FillRect(mem, &title, tb); DeleteObject(tb);
         
         RECT btnClose = {S(W) - S(46), 0, S(W), S(48)};
         if (g_maskDlgHover == 3) { HBRUSH cb = CreateSolidBrush(RGB(232, 17, 35)); FillRect(mem, &btnClose, cb); DeleteObject(cb); }
@@ -1097,8 +1205,8 @@ LRESULT CALLBACK MaskDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         
         DrawTextC(mem, L"1. 选择用于防窥的窗口：", {S(30), S(60), S(300), S(85)}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
         RECT selBtn = {S(30), S(90), S(W)-S(30), S(120)};
-        FillRound(mem, selBtn, S(8), (g_maskDlgHover==0) ? g_theme.hover : RGB(45,45,50));
-        StrokeRound(mem, selBtn, S(8), RGB(70,70,75), 1);
+        FillRound(mem, selBtn, S(8), (g_maskDlgHover==0) ? g_theme.hover : g_theme.cardBg);
+        StrokeRound(mem, selBtn, S(8), g_theme.textDim, 1);
         std::wstring maskName = L"点击此处拾取伪装窗口...";
         if (!g_cfg.maskKey.empty()) {
             size_t pos = g_cfg.maskKey.find(L"|");
@@ -1108,14 +1216,14 @@ LRESULT CALLBACK MaskDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
         DrawTextC(mem, maskName.c_str(), {selBtn.left + S(10), selBtn.top, selBtn.right - S(10), selBtn.bottom}, g_fNormal, (g_maskDlgHover==0) ? g_theme.accent : g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
         
         DrawTextC(mem, L"2. 目标透明度：", {S(30), S(140), S(150), S(170)}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        RECT pctFrame = {S(155), S(140), S(265), S(170)}; FillRound(mem, pctFrame, S(6), RGB(45, 45, 50)); StrokeRound(mem, pctFrame, S(6), RGB(70, 70, 75), 1);
+        RECT pctFrame = {S(155), S(140), S(265), S(170)}; FillRound(mem, pctFrame, S(6), g_theme.cardBg); StrokeRound(mem, pctFrame, S(6), g_theme.textDim, 1);
         DrawTextC(mem, L"%", {S(270), S(140), S(300), S(170)}, g_fNormal, g_theme.textDim, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
 
         int by = S(200), bw2 = S(80), bh = S(34);
         RECT cancelRc = {S(W) - S(30) - bw2*2 - S(10), by, S(W) - S(30) - bw2 - S(10), by+bh};
         RECT okRc     = {S(W) - S(30) - bw2,            by, S(W) - S(30),                by+bh};
-        FillRound(mem, cancelRc, S(8), (g_maskDlgHover==1) ? g_theme.hover : RGB(50, 50, 55));
-        StrokeRound(mem, cancelRc, S(8), RGB(70, 70, 75), 1);
+        FillRound(mem, cancelRc, S(8), (g_maskDlgHover==1) ? g_theme.hover : g_theme.cardBg);
+        StrokeRound(mem, cancelRc, S(8), g_theme.textDim, 1);
         DrawTextC(mem, L"取消", cancelRc, g_fNormal, (g_maskDlgHover==1) ? g_theme.accent : g_theme.text, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         FillRound(mem, okRc, S(8), (g_maskDlgHover==2) ? RGB(30, 150, 255) : g_theme.accent);
         DrawTextC(mem, L"确定开启", okRc, g_fNormal, RGB(255, 255, 255), DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -1200,19 +1308,38 @@ void ShowMaskDialog() {
 
 // ================= 设置窗口 =================
 LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    const int W = 440, H = 380;
+    const int W = 440, H = 540; // 窗口加高，容纳新选项和热键
     switch (msg) {
     case WM_CREATE:
         g_settingsHover = -1;
         g_settingsAutoStartTmp = g_cfg.autoStart;
         g_settingsRestoreTmp = g_cfg.restoreOnExit;
+        g_waitingHotkey = 0;
         return 0;
+    case WM_KEYDOWN: {
+        // 拦截自定义热键录入
+        if (g_waitingHotkey > 0 && wParam != VK_CONTROL && wParam != VK_MENU && wParam != VK_SHIFT) {
+            if (g_waitingHotkey == 1) g_cfg.hk_pick = wParam;
+            else if (g_waitingHotkey == 2) g_cfg.hk_boss = wParam;
+            else if (g_waitingHotkey == 3) g_cfg.hk_moyu = wParam;
+            else if (g_waitingHotkey == 4) g_cfg.hk_mask = wParam;
+            
+            RegisterAllHotkeys(g_hwnd);
+            g_waitingHotkey = 0;
+            SaveConfig();
+            InvalidateRect(hwnd, NULL, FALSE);
+            MessageBoxW(hwnd, L"快捷键修改成功！", L"提示", MB_OK);
+            return 0;
+        }
+        break;
+    }
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
         HDC mem = CreateCompatibleDC(hdc); HBITMAP bmp = CreateCompatibleBitmap(hdc, S(W), S(H)); SelectObject(mem, bmp);
         RECT rc = {0, 0, S(W), S(H)};
-        FillRound(mem, rc, S(12), RGB(35, 35, 40)); StrokeRound(mem, rc, S(12), RGB(60, 60, 65), 1);
-        RECT title = {0, 0, S(W), S(48)}; HBRUSH tb = CreateSolidBrush(RGB(28, 28, 32)); FillRect(mem, &title, tb); DeleteObject(tb);
+        FillRound(mem, rc, S(12), g_cfg.isLightTheme ? RGB(250, 250, 255) : RGB(35, 35, 40));
+        StrokeRound(mem, rc, S(12), g_theme.textDim, 1);
+        RECT title = {0, 0, S(W), S(48)}; HBRUSH tb = CreateSolidBrush(g_theme.cardBg); FillRect(mem, &title, tb); DeleteObject(tb);
         RECT btnClose = {S(W) - S(46), 0, S(W), S(48)};
         if (g_settingsHover == 6) { HBRUSH cb = CreateSolidBrush(RGB(232, 17, 35)); FillRect(mem, &btnClose, cb); DeleteObject(cb); }
         HPEN penC = CreatePen(PS_SOLID, 1, g_settingsHover==6 ? RGB(255,255,255) : g_theme.textDim); SelectObject(mem, penC);
@@ -1224,35 +1351,70 @@ LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         int rowY = S(70), rowH = S(32);
         RECT r1 = {S(30), rowY, S(W) - S(30), rowY + rowH};
         DrawCheckbox(mem, {r1.left, r1.top, r1.left + S(20), r1.bottom}, g_settingsAutoStartTmp, g_settingsHover == 0);
-        DrawTextC(mem, L"开机自启（写入 HKCU\\Run）", {r1.left + S(30), r1.top, r1.right, r1.bottom}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawTextC(mem, L"开机自启（写入 HKCU\\Run）", {r1.left + S(35), r1.top, r1.right, r1.bottom}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        
         RECT r2 = {S(30), rowY + S(38), S(W) - S(30), rowY + S(38) + rowH};
         DrawCheckbox(mem, {r2.left, r2.top, r2.left + S(20), r2.bottom}, g_settingsRestoreTmp, g_settingsHover == 1);
-        DrawTextC(mem, L"退出时自动恢复所有窗口透明度", {r2.left + S(30), r2.top, r2.right, r2.bottom}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawTextC(mem, L"退出时自动恢复所有窗口透明度", {r2.left + S(35), r2.top, r2.right, r2.bottom}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        
+        RECT r3 = {S(30), rowY + S(76), S(W) - S(30), rowY + S(76) + rowH};
+        DrawCheckbox(mem, {r3.left, r3.top, r3.left + S(20), r3.bottom}, g_cfg.maskOnAdjust, g_settingsHover == 7);
+        DrawTextC(mem, L"调节透明度时，强制拉起面具遮挡", {r3.left + S(35), r3.top, r3.right, r3.bottom}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
 
-        RECT sep = {S(30), S(180), S(W) - S(30), S(181)};
-        HBRUSH sb = CreateSolidBrush(RGB(60, 60, 65)); FillRect(mem, &sep, sb); DeleteObject(sb);
+        RECT r4 = {S(30), rowY + S(114), S(W) - S(30), rowY + S(114) + rowH};
+        DrawCheckbox(mem, {r4.left, r4.top, r4.left + S(20), r4.bottom}, g_cfg.isLightTheme, g_settingsHover == 8);
+        DrawTextC(mem, L"启用浅色主题 (浅色模式)", {r4.left + S(35), r4.top, r4.right, r4.bottom}, g_fNormal, g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
 
-        RECT hbR = {S(30), S(200), S(180), S(236)};
-        RECT rsR = {S(190), S(200), S(W) - S(30), S(236)};
-        FillRound(mem, hbR, S(8), (g_settingsHover == 2) ? g_theme.hover : RGB(45, 45, 50));
-        StrokeRound(mem, hbR, S(8), (g_settingsHover == 2) ? g_theme.accent : RGB(70, 70, 75), 1);
+        RECT sep0 = {S(30), S(230), S(W) - S(30), S(231)};
+        HBRUSH sb0 = CreateSolidBrush(g_theme.textDim); FillRect(mem, &sep0, sb0); DeleteObject(sb0);
+
+        DrawTextC(mem, L"快捷键自定义", {S(30), S(245), S(W) - S(30), S(265)}, g_fTitle, g_theme.accent, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        
+        const wchar_t* hkTitles[] = {L"拾取窗口", L"老板键", L"摸鱼模式", L"面具伪装"};
+        int hkCodes[] = {g_cfg.hk_pick, g_cfg.hk_boss, g_cfg.hk_moyu, g_cfg.hk_mask};
+        for (int i = 0; i < 4; i++) {
+            int hy = S(275) + i * S(34);
+            RECT hr = {S(30), hy, S(W) - S(150), hy + S(28)};
+            if (g_settingsHover == 10 + i) FillRound(mem, hr, S(6), g_theme.hover);
+            
+            wchar_t txt[128];
+            if (g_waitingHotkey == i + 1) {
+                // 修改了这里的提示语，更清晰
+                wsprintfW(txt, L"%s (请按 Ctrl+Alt+任意字母键)", hkTitles[i]);
+                DrawTextC(mem, txt, {hr.left + S(10), hr.top, hr.right, hr.bottom}, g_fNormal, g_theme.accent, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            } else {
+                wsprintfW(txt, L"%s (Ctrl+Alt+%c)", hkTitles[i], hkCodes[i]);
+                DrawTextC(mem, txt, {hr.left + S(10), hr.top, hr.right, hr.bottom}, g_fNormal, g_settingsHover == 10 + i ? g_theme.accent : g_theme.text, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            }
+            
+            RECT btnMod = {S(W) - S(130), hy, S(W) - S(30), hy + S(28)};
+            FillRound(mem, btnMod, S(6), (g_settingsHover == 20 + i) ? g_theme.hover : g_theme.cardBg);
+            StrokeRound(mem, btnMod, S(6), g_theme.textDim, 1);
+            DrawTextC(mem, L"点击修改", btnMod, g_fNormal, (g_settingsHover == 20 + i) ? g_theme.accent : g_theme.text, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+
+        RECT sep = {S(30), S(415), S(W) - S(30), S(416)};
+        HBRUSH sb = CreateSolidBrush(g_theme.textDim); FillRect(mem, &sep, sb); DeleteObject(sb);
+
+        // 恢复按钮原来的位置
+        RECT hbR = {S(30), S(430), S(180), S(466)};
+        RECT rsR = {S(190), S(430), S(W) - S(30), S(466)};
+        FillRound(mem, hbR, S(8), (g_settingsHover == 2) ? g_theme.hover : g_theme.cardBg);
+        StrokeRound(mem, hbR, S(8), g_theme.textDim, 1);
         DrawTextC(mem, L"打开使用说明", hbR, g_fNormal, (g_settingsHover == 2) ? g_theme.accent : g_theme.text, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-        FillRound(mem, rsR, S(8), (g_settingsHover == 3) ? RGB(80, 40, 40) : RGB(45, 45, 50));
-        StrokeRound(mem, rsR, S(8), (g_settingsHover == 3) ? RGB(220, 80, 80) : RGB(70, 70, 75), 1);
+        FillRound(mem, rsR, S(8), (g_settingsHover == 3) ? RGB(80, 40, 40) : g_theme.cardBg);
+        StrokeRound(mem, rsR, S(8), (g_settingsHover == 3) ? RGB(220, 80, 80) : g_theme.textDim, 1);
         DrawTextC(mem, L"重置所有窗口透明度", rsR, g_fNormal, (g_settingsHover == 3) ? RGB(255, 140, 140) : g_theme.text, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
-        RECT sep2 = {S(30), S(252), S(W) - S(30), S(253)};
-        HBRUSH sb2 = CreateSolidBrush(RGB(60, 60, 65)); FillRect(mem, &sep2, sb2); DeleteObject(sb2);
-
-        DrawTextC(mem, APP_NAME, {S(30), S(266), S(W) - S(30), S(294)}, g_fTitle, g_theme.accent, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawTextC(mem, APP_VERSION, {S(30), S(294), S(W) - S(30), S(316)}, g_fNormal, g_theme.textDim, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
-        DrawTextC(mem, APP_TAGLINE, {S(30), S(316), S(W) - S(30), S(338)}, g_fSmall, g_theme.textDim, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        // 版本号放在左下角，和右边按钮对齐
+        DrawTextC(mem, APP_NAME, {S(30), S(475), S(200), S(495)}, g_fTitle, g_theme.accent, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+        DrawTextC(mem, APP_VERSION, {S(30), S(495), S(200), S(515)}, g_fSmall, g_theme.textDim, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
 
         int by = S(H) - S(56), bw2 = S(86), bh = S(36);
         RECT cancelRc = {S(W) - S(30) - bw2*2 - S(10), by, S(W) - S(30) - bw2 - S(10), by + bh};
         RECT okRc     = {S(W) - S(30) - bw2,            by, S(W) - S(30),                 by + bh};
-        FillRound(mem, cancelRc, S(8), (g_settingsHover == 5) ? g_theme.hover : RGB(50, 50, 55));
-        StrokeRound(mem, cancelRc, S(8), RGB(70, 70, 75), 1);
+        FillRound(mem, cancelRc, S(8), (g_settingsHover == 5) ? g_theme.hover : g_theme.cardBg);
+        StrokeRound(mem, cancelRc, S(8), g_theme.textDim, 1);
         DrawTextC(mem, L"取消", cancelRc, g_fNormal, (g_settingsHover == 5) ? g_theme.accent : g_theme.text, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         FillRound(mem, okRc, S(8), (g_settingsHover == 4) ? RGB(30, 150, 255) : g_theme.accent);
         DrawTextC(mem, L"确定", okRc, g_fNormal, RGB(255, 255, 255), DT_CENTER|DT_VCENTER|DT_SINGLELINE);
@@ -1265,7 +1427,18 @@ LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (pt.x > S(W) - S(46) && pt.y < S(48)) hb = 6;
         else if (pt.y >= S(70) && pt.y < S(70) + S(32) && pt.x >= S(30) && pt.x < S(W) - S(30)) hb = 0;
         else if (pt.y >= S(108) && pt.y < S(108) + S(32) && pt.x >= S(30) && pt.x < S(W) - S(30)) hb = 1;
-        else if (pt.y >= S(200) && pt.y < S(236)) {
+        else if (pt.y >= S(146) && pt.y < S(146) + S(32) && pt.x >= S(30) && pt.x < S(W) - S(30)) hb = 7;
+        else if (pt.y >= S(184) && pt.y < S(184) + S(32) && pt.x >= S(30) && pt.x < S(W) - S(30)) hb = 8;
+        
+        for (int i = 0; i < 4; i++) {
+            int hy = S(275) + i * S(34);
+            if (pt.y >= hy && pt.y < hy + S(28)) {
+                if (pt.x >= S(30) && pt.x < S(W) - S(150)) hb = 10 + i;
+                else if (pt.x >= S(W) - S(130) && pt.x < S(W) - S(30)) hb = 20 + i;
+            }
+        }
+
+        if (pt.y >= S(430) && pt.y < S(466)) {
             if (pt.x >= S(30) && pt.x < S(180)) hb = 2;
             else if (pt.x >= S(190) && pt.x < S(W) - S(30)) hb = 3;
         } else if (pt.y >= S(H) - S(56) && pt.y < S(H) - S(20)) {
@@ -1287,7 +1460,22 @@ LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         if (pt.y >= S(108) && pt.y < S(108) + S(32) && pt.x >= S(30) && pt.x < S(W) - S(30)) {
             g_settingsRestoreTmp = !g_settingsRestoreTmp; InvalidateRect(hwnd, NULL, FALSE); return 0;
         }
-        if (pt.y >= S(200) && pt.y < S(236)) {
+        if (pt.y >= S(146) && pt.y < S(146) + S(32) && pt.x >= S(30) && pt.x < S(W) - S(30)) {
+            g_cfg.maskOnAdjust = !g_cfg.maskOnAdjust; InvalidateRect(hwnd, NULL, FALSE); return 0;
+        }
+        if (pt.y >= S(184) && pt.y < S(184) + S(32) && pt.x >= S(30) && pt.x < S(W) - S(30)) {
+            g_cfg.isLightTheme = !g_cfg.isLightTheme; UpdateTheme(); InvalidateRect(g_hwnd, NULL, FALSE); InvalidateRect(hwnd, NULL, FALSE); return 0;
+        }
+
+        for (int i = 0; i < 4; i++) {
+            int hy = S(275) + i * S(34);
+            if (pt.y >= hy && pt.y < hy + S(28)) {
+                if (pt.x >= S(30) && pt.x < S(W) - S(150)) { g_waitingHotkey = i + 1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+                if (pt.x >= S(W) - S(130) && pt.x < S(W) - S(30)) { g_waitingHotkey = i + 1; InvalidateRect(hwnd, NULL, FALSE); return 0; }
+            }
+        }
+
+        if (pt.y >= S(430) && pt.y < S(466)) {
             if (pt.x >= S(30) && pt.x < S(180)) { ShowHelpWindow(); return 0; }
             if (pt.x >= S(190) && pt.x < S(W) - S(30)) { ResetAllWindows(); SaveConfig(); return 0; }
         }
@@ -1312,7 +1500,7 @@ LRESULT CALLBACK SettingsDlgProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
         return 0;
     }
     case WM_CLOSE: DestroyWindow(hwnd); return 0;
-    case WM_DESTROY: g_hSettingsDlg = NULL; g_settingsHover = -1; return 0;
+    case WM_DESTROY: g_hSettingsDlg = NULL; g_settingsHover = -1; g_waitingHotkey = 0; return 0;
     }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
@@ -1325,11 +1513,12 @@ void ShowSettingsDialog() {
         wc.hbrBackground = (HBRUSH)GetStockObject(NULL_BRUSH); wc.lpszClassName = L"Win3CSettings";
         RegisterClassExW(&wc); reg = true;
     }
-    int w = S(440), h = S(380);
+    int w = S(440), h = S(540);
     int x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2, y = (GetSystemMetrics(SM_CYSCREEN) - h) / 2;
     g_hSettingsDlg = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, L"Win3CSettings", L"设置", WS_POPUP, x, y, w, h, g_hwnd, NULL, GetModuleHandleW(NULL), NULL);
     SetWindowRgn(g_hSettingsDlg, CreateRoundRectRgn(0, 0, w+1, h+1, S(24), S(24)), TRUE);
     ShowWindow(g_hSettingsDlg, SW_SHOW); SetForegroundWindow(g_hSettingsDlg);
+    SetFocus(g_hSettingsDlg); // 让设置窗口获取焦点以便捕获按键
 }
 
 // ================= 主界面绘制 =================
@@ -1348,8 +1537,8 @@ void PaintMain(HWND hwnd) {
     PAINTSTRUCT ps; HDC hdc = BeginPaint(hwnd, &ps);
     HDC mem = CreateCompatibleDC(hdc); HBITMAP bmp = CreateCompatibleBitmap(hdc, S(WIN_W), S(WIN_H)); SelectObject(mem, bmp); SetBkMode(mem, TRANSPARENT);
 
-    RECT sidebar = {0, 0, S(SIDEBAR_W), S(WIN_H)}; HBRUSH sbB = CreateSolidBrush(RGB(28, 28, 32)); FillRect(mem, &sidebar, sbB); DeleteObject(sbB);
-    RECT line = {S(SIDEBAR_W), 0, S(SIDEBAR_W)+1, S(WIN_H)}; HBRUSH lb = CreateSolidBrush(RGB(50, 50, 55)); FillRect(mem, &line, lb); DeleteObject(lb);
+    RECT sidebar = {0, 0, S(SIDEBAR_W), S(WIN_H)}; HBRUSH sbB = CreateSolidBrush(g_cfg.isLightTheme ? RGB(240, 240, 245) : RGB(28, 28, 32)); FillRect(mem, &sidebar, sbB); DeleteObject(sbB);
+    RECT line = {S(SIDEBAR_W), 0, S(SIDEBAR_W)+1, S(WIN_H)}; HBRUSH lb = CreateSolidBrush(g_cfg.isLightTheme ? RGB(200, 200, 205) : RGB(50, 50, 55)); FillRect(mem, &line, lb); DeleteObject(lb);
 
     FillCircle(mem, S(30), S(40), S(6), g_theme.accent); FillCircle(mem, S(30), S(40), S(3), RGB(255, 255, 255));
     DrawTextC(mem, APP_NAME, {S(45), S(25), S(200), S(45)}, g_fTitle, g_theme.text, DT_LEFT|DT_SINGLELINE);
@@ -1357,19 +1546,20 @@ void PaintMain(HWND hwnd) {
 
     DrawTextC(mem, L"搜索目标窗口", {S(20), S(100), S(200), S(120)}, g_fSmall, g_theme.textDim, DT_LEFT|DT_SINGLELINE);
     RECT sb = {S(20), S(125), S(SIDEBAR_W - 20), S(125 + 36)};
-    FillRound(mem, sb, S(8), RGB(40, 40, 45)); StrokeRound(mem, sb, S(8), RGB(60, 60, 65), 1);
+    FillRound(mem, sb, S(8), g_theme.cardBg); StrokeRound(mem, sb, S(8), g_theme.textDim, 1);
 
     DrawTextC(mem, L"已锁定窗口", {S(20), S(175), S(200), S(195)}, g_fSmall, g_theme.textDim, DT_LEFT|DT_SINGLELINE);
     RECT tb = {S(20), S(200), S(SIDEBAR_W - 20), S(200 + 44)};
-    FillRound(mem, tb, S(8), g_hoverTarget ? RGB(45,45,50) : RGB(35, 35, 40)); StrokeRound(mem, tb, S(8), g_hoverTarget ? g_theme.accent : RGB(60, 60, 65), g_hoverTarget ? 2 : 1);
+    FillRound(mem, tb, S(8), g_cfg.isLightTheme ? RGB(220, 220, 225) : (g_hoverTarget ? RGB(45,45,50) : RGB(35, 35, 40))); 
+    StrokeRound(mem, tb, S(8), g_hoverTarget ? g_theme.accent : g_theme.textDim, g_hoverTarget ? 2 : 1);
     DrawTextC(mem, titleLocal.c_str(), {tb.left+S(12), tb.top, tb.right-S(30), tb.bottom}, g_fNormal, has?g_theme.text:g_theme.textDim, DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS);
 
     RECT br = {S(20), S(260), S(SIDEBAR_W - 20) - 46, S(260 + 36)};
-    FillRound(mem, br, S(8), g_hoverBtn==0 ? RGB(50, 50, 55) : RGB(38, 38, 42));
+    FillRound(mem, br, S(8), g_hoverBtn==0 ? g_theme.hover : g_theme.cardBg);
     DrawTextC(mem, L"刷新窗口", br, g_fNormal, g_hoverBtn==0?g_theme.accent:g_theme.text, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
     RECT prBtn = {S(SIDEBAR_W - 20) - 36, S(260), S(SIDEBAR_W - 20), S(260 + 36)};
-    FillRound(mem, prBtn, S(8), g_hoverPick ? RGB(50, 50, 55) : RGB(38, 38, 42));
+    FillRound(mem, prBtn, S(8), g_hoverPick ? g_theme.hover : g_theme.cardBg);
     DrawCrosshair(mem, (prBtn.left+prBtn.right)/2, (prBtn.top+prBtn.bottom)/2, g_hoverPick ? g_theme.accent : g_theme.textDim);
 
     // 底部三个按钮
@@ -1378,13 +1568,13 @@ void PaintMain(HWND hwnd) {
     RECT minRc = {S(30) + bw, S(WIN_H - 60), S(30) + bw * 2, S(WIN_H - 20)};
     RECT clsRc = {S(40) + bw * 2, S(WIN_H - 60), S(40) + bw * 3, S(WIN_H - 20)};
     
-    FillRound(mem, selfRc, S(6), g_hoverSelf ? RGB(50, 50, 55) : RGB(38, 38, 42));
+    FillRound(mem, selfRc, S(6), g_hoverSelf ? g_theme.hover : g_theme.cardBg);
     DrawTextC(mem, L"自透", selfRc, g_fNormal, g_hoverSelf ? g_theme.accent : g_theme.textDim, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     
-    FillRound(mem, minRc, S(6), g_hoverMin ? RGB(50, 50, 55) : RGB(38, 38, 42));
+    FillRound(mem, minRc, S(6), g_hoverMin ? g_theme.hover : g_theme.cardBg);
     DrawTextC(mem, L"隐藏", minRc, g_fNormal, g_hoverMin ? g_theme.accent : g_theme.textDim, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     
-    FillRound(mem, clsRc, S(6), g_hoverClose ? RGB(60, 30, 30) : RGB(38, 38, 42));
+    FillRound(mem, clsRc, S(6), g_hoverClose ? RGB(60, 30, 30) : g_theme.cardBg);
     DrawTextC(mem, L"退出", clsRc, g_fNormal, g_hoverClose ? RGB(255, 100, 100) : g_theme.textDim, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
 
     int cx = S(SIDEBAR_W) + S(40); int cw = S(WIN_W) - cx - S(40);
@@ -1397,22 +1587,22 @@ void PaintMain(HWND hwnd) {
     if (!has) DrawTextC(mem, L"← 请先在左侧选择目标窗口", {cx, S(235), cx+cw, S(255)}, g_fSmall, RGB(200, 80, 80), DT_RIGHT|DT_SINGLELINE);
 
     int sy = S(260), sh = S(8);
-    RECT tr = {cx, sy, cx+cw, sy+sh}; FillRound(mem, tr, sh/2, RGB(50, 50, 55));
+    RECT tr = {cx, sy, cx+cw, sy+sh}; FillRound(mem, tr, sh/2, g_theme.hover);
     int kx = cx + cw * (renderAlpha - MIN_ALPHA) / (MAX_ALPHA - MIN_ALPHA);
     if (has && renderAlpha > MIN_ALPHA) { RECT fr = {cx, sy, kx, sy+sh}; FillRound(mem, fr, sh/2, g_theme.accent); }
-    FillCircle(mem, kx, sy+sh/2, S(12), RGB(25, 25, 30)); FillCircle(mem, kx, sy+sh/2, S(10), has ? g_theme.accent : RGB(80,80,85));
+    FillCircle(mem, kx, sy+sh/2, S(12), g_theme.text); FillCircle(mem, kx, sy+sh/2, S(10), has ? g_theme.accent : g_theme.textDim);
     if (has) FillCircle(mem, kx, sy+sh/2, S(4), RGB(255, 255, 255));
 
-    COLORREF btnBg = has ? RGB(38,38,42) : RGB(28,28,32);
-    COLORREF btnHover = has ? RGB(50,50,55) : RGB(28,28,32);
-    COLORREF btnText = has ? g_theme.text : RGB(80,80,85);
+    COLORREF btnBg = has ? g_theme.cardBg : (g_cfg.isLightTheme ? RGB(240,240,240) : RGB(28,28,32));
+    COLORREF btnHover = has ? g_theme.hover : (g_cfg.isLightTheme ? RGB(230,230,230) : RGB(28,28,32));
+    COLORREF btnText = has ? g_theme.text : g_theme.textDim;
 
     const wchar_t* pre[] = {L"25%", L"50%", L"75%", L"100%"};
     int pw = (cw - S(30)) / 4;
     for(int i=0; i<4; i++) {
         RECT prc = {cx + i*(pw+S(10)), S(320), cx + i*(pw+S(10)) + pw, S(320+44)};
         bool hov = has && (g_hoverPreset == i);
-        FillRound(mem, prc, S(8), hov ? btnHover : btnBg); StrokeRound(mem, prc, S(8), hov ? g_theme.accent : RGB(60,60,65), 1);
+        FillRound(mem, prc, S(8), hov ? btnHover : btnBg); StrokeRound(mem, prc, S(8), hov ? g_theme.accent : g_theme.textDim, 1);
         DrawTextC(mem, pre[i], prc, g_fNormal, hov ? g_theme.accent : btnText, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
@@ -1434,9 +1624,9 @@ void PaintMain(HWND hwnd) {
 
         COLORREF bg = active ? g_theme.accent : (hov ? btnHover : btnBg);
         COLORREF text = active ? RGB(255,255,255) : (hov ? g_theme.accent : btnText);
-        if (i == 4) { bg = hov ? btnHover : RGB(38,38,42); text = hov ? g_theme.accent : g_theme.text; }
+        if (i == 4) { bg = hov ? btnHover : btnBg; text = hov ? g_theme.accent : g_theme.text; }
 
-        FillRound(mem, fr, S(8), bg); StrokeRound(mem, fr, S(8), active ? g_theme.accent : RGB(60,60,65), 1);
+        FillRound(mem, fr, S(8), bg); StrokeRound(mem, fr, S(8), active ? g_theme.accent : g_theme.textDim, 1);
         DrawTextC(mem, fb[i], fr, g_fNormal, text, DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     }
 
@@ -1446,7 +1636,7 @@ void PaintMain(HWND hwnd) {
 void RestoreApp(HWND hwnd) {
     EnableAcrylic(hwnd, 0, false); ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd);
     SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
-    EnableAcrylic(hwnd, 0x99000000, true); RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME); InvalidateRect(hwnd, NULL, TRUE);
+    EnableAcrylic(hwnd, g_cfg.isLightTheme ? 0x99F0F0F0 : 0x99000000, true); RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_UPDATENOW | RDW_ERASE | RDW_FRAME); InvalidateRect(hwnd, NULL, TRUE);
 }
 
 // ================= 主窗口消息处理 =================
@@ -1479,6 +1669,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         Shell_NotifyIconW(NIM_ADD, &g_nid);
 
         LoadConfig();
+        UpdateTheme();
         g_cfg.autoStart = IsAutoStartEnabled();
         g_lastFadeSec   = g_cfg.lastFadeSec;
         g_lastFadePct   = g_cfg.lastFadePct;
@@ -1495,7 +1686,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (wParam == TIMER_MASK_DELAY_APPLY) {
             KillTimer(hwnd, TIMER_MASK_DELAY_APPLY);
             if (IsWindow(g_pendingMaskTarget)) {
-                // 在底下偷偷修改透明度
                 ApplyAlpha(g_pendingMaskTarget, g_pendingMaskAlpha, true);
                 EnterCriticalSection(&g_cs);
                 g_render_alpha = g_pendingMaskAlpha; 
@@ -1505,7 +1695,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 LeaveCriticalSection(&g_cs);
                 InvalidateRect(hwnd, NULL, FALSE);
             }
-            // 再等 1 秒撤走面具
             SetTimer(hwnd, TIMER_MASK_RESTORE, 1000, NULL);
             return 0;
         }
@@ -1536,8 +1725,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         return 0;
 
     case WM_CTLCOLOREDIT: {
-        HDC hdc = (HDC)wParam; SetTextColor(hdc, g_theme.text); SetBkColor(hdc, RGB(40, 40, 45));
-        static HBRUSH b = NULL; if (!b) b = CreateSolidBrush(RGB(40, 40, 45)); return (LRESULT)b;
+        HDC hdc = (HDC)wParam; SetTextColor(hdc, g_theme.text); SetBkColor(hdc, g_theme.cardBg);
+        static HBRUSH b = NULL; if (!b) b = CreateSolidBrush(g_theme.cardBg); return (LRESULT)b;
     }
 
     case WM_COMMAND:
@@ -1701,12 +1890,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_hoverMaskBtn && HasTarget()) {
             if (g_cfg.maskEnabled) {
                 g_cfg.maskEnabled = false; // 关闭面具
-                
-                // 清理可能还在潜伏的定时器
                 KillTimer(hwnd, TIMER_MASK_DELAY_APPLY);
                 KillTimer(hwnd, TIMER_MASK_RESTORE);
 
-                // 强制把真实窗口变成当前界面显示的透明度
                 HWND t = GetRealTarget();
                 if (IsWindow(t)) {
                     EnterCriticalSection(&g_cs);
@@ -1744,7 +1930,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if (g_hoverPreset != -1 && HasTarget()) {
             int a[] = {64, 128, 191, 255};
             HWND t = GetRealTarget();
-            if (g_cfg.maskEnabled) {
+            if (g_cfg.maskEnabled && g_cfg.maskOnAdjust) {
                 ExecuteWithMask(t, a[g_hoverPreset], true);
             } else {
                 EnterCriticalSection(&g_cs); g_target_alpha = a[g_hoverPreset]; LeaveCriticalSection(&g_cs);
@@ -1761,7 +1947,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             ReleaseCapture();
             HWND t = GetRealTarget();
             if (IsWindow(t)) {
-                if (g_cfg.maskEnabled) ExecuteWithMask(t, g_target_alpha, true);
+                if (g_cfg.maskEnabled && g_cfg.maskOnAdjust) ExecuteWithMask(t, g_target_alpha, true);
                 else ApplyAlpha(t, g_target_alpha, true);
             }
             SaveConfig();
@@ -1771,10 +1957,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_HOTKEY: {
+        if (wParam == HK_EMERGENCY) {
+            ToggleEmergencyMask();
+            return 0;
+        }
+
         if (wParam == HK_MASK) {
+            if (g_cfg.maskKey.empty()) {
+                MessageBoxW(hwnd, L"请先在主界面点击「面具」设置伪装窗口！", L"提示", MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
             HWND t = GetRealTarget();
             if (!t) t = GetForegroundWindow();
-            if (t == g_hwnd || t == GetMaskWindow()) return 0;
+            HWND maskWin = GetMaskWindow();
+            if (t == g_hwnd || t == maskWin) return 0;
             
             int curA = 255;
             std::wstring k = GetKey(t);
@@ -1782,7 +1978,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_profiles.count(k)) curA = g_profiles[k].alpha;
             LeaveCriticalSection(&g_cs);
             
+            bool oldEnabled = g_cfg.maskOnAdjust;
+            g_cfg.maskOnAdjust = true;
             ExecuteWithMask(t, curA, true);
+            g_cfg.maskOnAdjust = oldEnabled;
             return 0;
         }
 
@@ -1810,10 +2009,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         if (wParam == HK_RESET) { ResetAllWindows(); SaveConfig(); return 0; }
 
+        // ★ 快捷键逻辑：永远优先操作当前前台窗口
         HWND fg = GetForegroundWindow();
-        if (g_cfg.maskEnabled) fg = GetRealTarget(); // 如果面具开启，强制锁死目标
+        if (fg == hwnd || fg == g_hSettingsDlg || fg == g_hMaskDlg || fg == g_hEmergencyMask) return 0;
         
-        if (!fg || fg == hwnd) return 0;
+        // 如果获取不到前台窗口，再退回使用锁定的目标
+        if (!fg) fg = GetRealTarget();
+        if (!fg) return 0;
+
         int cur = 255;
         if (GetWindowLongPtrW(fg, GWL_EXSTYLE) & WS_EX_LAYERED) {
             std::wstring k = GetKey(fg);
@@ -1821,6 +2024,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (g_profiles.count(k)) cur = g_profiles[k].alpha;
             LeaveCriticalSection(&g_cs);
         }
+        
         if (wParam == HK_DOWN)          ApplyAlphaSafe(fg, cur - STEP_ALPHA);
         else if (wParam == HK_UP)       ApplyAlphaSafe(fg, cur + STEP_ALPHA);
         else if (wParam >= HK_P1 && wParam <= HK_P4) {
@@ -1879,7 +2083,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
-int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, LPWSTR lpCmd, int nShow) {
     (void)hPrev; (void)lpCmd;
     WNDCLASSEXW wc = {sizeof(wc)};
     wc.lpfnWndProc = WndProc;
@@ -1903,17 +2107,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmd, int nShow) {
         if (DwmSetWindowAttribute) { int pref = 2; DwmSetWindowAttribute(hwnd, 33, &pref, sizeof(pref)); }
     }
 
-    RegisterHotKey(hwnd, HK_DOWN, MOD_CONTROL|MOD_ALT, VK_LEFT);
-    RegisterHotKey(hwnd, HK_UP,   MOD_CONTROL|MOD_ALT, VK_RIGHT);
-    RegisterHotKey(hwnd, HK_RESET, MOD_CONTROL|MOD_ALT, '0');
-    RegisterHotKey(hwnd, HK_P1, MOD_CONTROL|MOD_SHIFT, '1');
-    RegisterHotKey(hwnd, HK_P2, MOD_CONTROL|MOD_SHIFT, '2');
-    RegisterHotKey(hwnd, HK_P3, MOD_CONTROL|MOD_SHIFT, '3');
-    RegisterHotKey(hwnd, HK_P4, MOD_CONTROL|MOD_SHIFT, '4');
-    RegisterHotKey(hwnd, HK_PICK, MOD_CONTROL|MOD_ALT, 'P');
-    RegisterHotKey(hwnd, HK_BOSS, MOD_CONTROL|MOD_ALT, 'H');
-    RegisterHotKey(hwnd, HK_MOYU, MOD_CONTROL|MOD_ALT, 'M');
-    RegisterHotKey(hwnd, HK_MASK, MOD_CONTROL|MOD_ALT, 'B');
+    RegisterAllHotkeys(hwnd);
 
     ShowWindow(hwnd, nShow);
     UpdateWindow(hwnd);
